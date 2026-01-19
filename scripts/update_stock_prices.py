@@ -1,14 +1,14 @@
 """
 Daily Stock Price Updater for Tips Music
-Fetches latest stock price from Yahoo Finance and updates Supabase
-Run daily at 6:30 PM IST (after market close at 3:30 PM)
+Fetches latest stock price from NSE India website and updates Supabase
+Run daily at 6:30 PM IST (after NSE market close at 3:30 PM)
 """
 
-import yfinance as yf
 import requests
 from datetime import datetime, timedelta
 import os
 import time
+import json
 import sys
 
 # ============================================================
@@ -16,116 +16,114 @@ import sys
 # ============================================================
 
 SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://bfafqccvzboyfjewzvhk.supabase.co')
-SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')  # Use service_role key, not anon
-
-# FIXED: Use BSE symbol instead of NSE (Yahoo Finance NSE feed is broken)
-STOCK_SYMBOL = 'TIPSMUSIC.BO'  # BSE (Bombay Stock Exchange)
-# Alternative: 'TIPSMUSIC.NS' for NSE (National Stock Exchange) - currently broken
-
+SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
+STOCK_SYMBOL = 'TIPSMUSIC'  # NSE symbol
 COMPANY_NAME = 'Tips Music Ltd'
-DB_SYMBOL = 'TIPSMUSIC'  # Symbol stored in database
 
 # ============================================================
-# FETCH LATEST STOCK PRICE
+# FETCH FROM NSE INDIA
 # ============================================================
 
-def fetch_latest_stock_price(days_back=10):
+def fetch_nse_stock_data(symbol='TIPSMUSIC', days_back=10):
     """
-    Fetch last N days of stock data to ensure we don't miss any trading days
-    Yahoo Finance sometimes has delays, so we fetch last 10 days and update all
+    Fetch stock data from NSE India website
+    NSE provides free historical data through their website
     """
-    print(f"📈 Fetching {COMPANY_NAME} stock data from Yahoo Finance...")
-    print(f"   Symbol: {STOCK_SYMBOL} (BSE)")
+    print(f"📈 Fetching {COMPANY_NAME} stock data from NSE India...")
+    print(f"   Symbol: {symbol}")
+    
+    # NSE requires proper headers to prevent blocking
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Referer': 'https://www.nseindia.com/',
+    }
+    
+    # Create session to maintain cookies
+    session = requests.Session()
+    session.headers.update(headers)
     
     try:
+        # Step 1: Visit homepage to get cookies
+        print("   → Initializing NSE session...")
+        home_url = 'https://www.nseindia.com/'
+        session.get(home_url, timeout=10)
+        time.sleep(1)  # Small delay
+        
+        # Step 2: Fetch historical data
         # Calculate date range
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days_back)
         
-        print(f"   Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+        # Format dates for NSE API (DD-MM-YYYY)
+        from_date = start_date.strftime('%d-%m-%Y')
+        to_date = end_date.strftime('%d-%m-%Y')
         
-        # Fetch data with retry logic
-        ticker = yf.Ticker(STOCK_SYMBOL)
-        df = ticker.history(
-            start=start_date.strftime('%Y-%m-%d'),
-            end=end_date.strftime('%Y-%m-%d'),
-            interval='1d',
-            auto_adjust=True,  # Adjust for splits/dividends
-            actions=False      # Don't include dividends/splits columns
-        )
+        print(f"   → Fetching data from {from_date} to {to_date}...")
         
-        if df.empty:
-            print("⚠️  No stock data returned from Yahoo Finance")
-            print("   Possible reasons:")
-            print("   - Market is closed (weekend/holiday)")
-            print("   - Yahoo Finance API temporary issue")
-            print("   - Trading suspension")
+        # NSE Historical Data API endpoint
+        api_url = f'https://www.nseindia.com/api/historical/cm/equity?symbol={symbol}&series=[%22EQ%22]&from={from_date}&to={to_date}'
+        
+        response = session.get(api_url, timeout=15)
+        
+        if response.status_code != 200:
+            print(f"   ❌ NSE API returned status: {response.status_code}")
             return []
         
-        # Process data
-        df = df.reset_index()
+        data = response.json()
         
-        # Handle both 'Date' and 'Datetime' column names
-        if 'Datetime' in df.columns:
-            df = df.rename(columns={'Datetime': 'Date'})
+        if not data or 'data' not in data or not data['data']:
+            print("   ⚠️  No data returned from NSE")
+            return []
         
-        df = df.rename(columns={
-            'Date': 'date',
-            'Open': 'open',
-            'High': 'high',
-            'Low': 'low',
-            'Close': 'close',
-            'Volume': 'volume'
-        })
+        # Parse NSE response
+        records = []
+        for item in data['data']:
+            # NSE date format: "17-Jan-2026"
+            date_str = item.get('CH_TIMESTAMP', '')
+            if not date_str:
+                continue
+            
+            # Parse date
+            date_obj = datetime.strptime(date_str, '%d-%b-%Y').date()
+            
+            # Extract OHLCV data
+            record = {
+                'date': date_obj.isoformat(),
+                'open': float(item.get('CH_OPENING_PRICE', 0)),
+                'high': float(item.get('CH_TRADE_HIGH_PRICE', 0)),
+                'low': float(item.get('CH_TRADE_LOW_PRICE', 0)),
+                'close': float(item.get('CH_CLOSING_PRICE', 0)),
+                'volume': int(item.get('CH_TOT_TRADED_QTY', 0)),
+                'symbol': 'TIPSMUSIC',
+                'data_source': 'nse_india'
+            }
+            
+            # Only include records with valid prices
+            if record['close'] > 0:
+                records.append(record)
         
-        # Keep only required columns (case-insensitive check)
-        available_cols = [col.lower() for col in df.columns]
-        required_cols = ['date', 'open', 'high', 'low', 'close', 'volume']
+        # Sort by date (oldest to newest)
+        records.sort(key=lambda x: x['date'])
         
-        # Map columns (handle case variations)
-        col_mapping = {}
-        for req_col in required_cols:
-            for idx, col in enumerate(df.columns):
-                if col.lower() == req_col:
-                    col_mapping[col] = req_col
-                    break
-        
-        df = df.rename(columns=col_mapping)
-        df = df[required_cols]
-        
-        # Add metadata
-        df['symbol'] = DB_SYMBOL  # Use consistent symbol for database
-        df['data_source'] = 'yahoo_finance_bse'
-        
-        # Convert date to date only (remove time)
-        df['date'] = df['date'].dt.date
-        
-        # Remove rows with zero/null prices
-        df = df[df['close'] > 0]
-        
-        # Remove duplicates (keep latest)
-        df = df.drop_duplicates(subset=['date'], keep='last')
-        
-        # Sort by date
-        df = df.sort_values('date')
-        
-        # Convert to list of dicts
-        records = df.to_dict('records')
-        
-        print(f"✅ Fetched {len(records)} trading days")
-        
-        if len(records) > 0:
+        print(f"✅ Fetched {len(records)} trading days from NSE India")
+        if records:
             print(f"   Date range: {records[0]['date']} to {records[-1]['date']}")
-            latest = records[-1]
-            print(f"   Latest price: ₹{latest['close']:.2f} on {latest['date']}")
-            print(f"   Latest volume: {latest['volume']:,}")
+            print(f"   Latest price: ₹{records[-1]['close']:.2f} on {records[-1]['date']}")
         
         return records
     
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Network error fetching NSE data: {e}")
+        return []
+    except json.JSONDecodeError as e:
+        print(f"❌ Error parsing NSE response: {e}")
+        return []
     except Exception as e:
-        print(f"❌ Error fetching stock data: {e}")
-        import traceback
-        print(traceback.format_exc())
+        print(f"❌ Unexpected error: {e}")
         return []
 
 # ============================================================
@@ -152,25 +150,10 @@ def update_supabase(records):
         'apikey': SUPABASE_SERVICE_KEY,
         'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
         'Content-Type': 'application/json',
-        'Prefer': 'resolution=merge-duplicates'  # Upsert: update if exists, insert if new
+        'Prefer': 'resolution=merge-duplicates'
     }
     
     print(f"\n💾 Updating Supabase with {len(records)} records...")
-    
-    # Convert date objects to strings for JSON serialization
-    for record in records:
-        if hasattr(record['date'], 'isoformat'):
-            record['date'] = record['date'].isoformat()
-        else:
-            record['date'] = str(record['date'])
-        
-        # Ensure all numeric values are float (not numpy types)
-        for key in ['open', 'high', 'low', 'close']:
-            if key in record:
-                record[key] = float(record[key])
-        
-        if 'volume' in record:
-            record['volume'] = int(record['volume'])
     
     # Insert in batches
     batch_size = 100
@@ -187,9 +170,9 @@ def update_supabase(records):
                 print(f"   ✅ Batch {i//batch_size + 1}: {len(batch)} records updated")
             else:
                 print(f"   ❌ Batch {i//batch_size + 1} failed: HTTP {response.status_code}")
-                print(f"   Response: {response.text[:300]}")
+                print(f"   Response: {response.text[:200]}")
             
-            time.sleep(0.5)  # Rate limiting
+            time.sleep(0.5)
         
         except Exception as e:
             print(f"   ❌ Batch {i//batch_size + 1} error: {e}")
@@ -199,17 +182,15 @@ def update_supabase(records):
     return total_updated
 
 # ============================================================
-# VERIFY UPDATE IN SUPABASE
+# VERIFY UPDATE
 # ============================================================
 
 def verify_latest_data():
-    """
-    Verify that the latest data was successfully written to Supabase
-    """
+    """Verify latest data was successfully written to Supabase"""
     if not SUPABASE_SERVICE_KEY:
         return
     
-    url = f"{SUPABASE_URL}/rest/v1/stock_prices?symbol=eq.{DB_SYMBOL}&order=date.desc&limit=3"
+    url = f"{SUPABASE_URL}/rest/v1/stock_prices?symbol=eq.TIPSMUSIC&order=date.desc&limit=1"
     
     headers = {
         'apikey': SUPABASE_SERVICE_KEY,
@@ -222,44 +203,17 @@ def verify_latest_data():
         if response.status_code == 200:
             data = response.json()
             if data:
-                print(f"\n🔍 Latest records in Supabase (last 3 trading days):")
-                for i, record in enumerate(data[:3], 1):
-                    print(f"   {i}. Date: {record['date']} | Price: ₹{record['close']:.2f} | Volume: {record['volume']:,}")
+                latest = data[0]
+                print(f"\n🔍 Latest record in Supabase:")
+                print(f"   Date: {latest['date']}")
+                print(f"   Price: ₹{latest['close']:.2f}")
+                print(f"   Volume: {latest['volume']:,}")
+                print(f"   Source: {latest['data_source']}")
             else:
                 print("⚠️  No records found in Supabase")
-        else:
-            print(f"⚠️  Could not verify: HTTP {response.status_code}")
     
     except Exception as e:
         print(f"⚠️  Verification error: {e}")
-
-# ============================================================
-# BACKFILL HISTORICAL DATA (OPTIONAL)
-# ============================================================
-
-def backfill_historical_data(start_date='2023-01-01'):
-    """
-    One-time backfill of historical data from a specific date
-    Usage: Call this manually to fill gaps in historical data
-    """
-    print(f"\n📅 BACKFILL MODE: Fetching data from {start_date} to today...")
-    
-    end_date = datetime.now()
-    start = datetime.strptime(start_date, '%Y-%m-%d')
-    days_back = (end_date - start).days
-    
-    print(f"   Total days to fetch: {days_back}")
-    
-    records = fetch_latest_stock_price(days_back=days_back)
-    
-    if records:
-        print(f"   Found {len(records)} trading days")
-        updated = update_supabase(records)
-        print(f"   Backfilled {updated} records")
-        return updated
-    else:
-        print("   No data to backfill")
-        return 0
 
 # ============================================================
 # MAIN EXECUTION
@@ -282,19 +236,8 @@ def main():
         print("   Add it to GitHub Secrets: Settings → Secrets → Actions")
         sys.exit(1)
     
-    # Check if backfill mode is requested (via environment variable)
-    backfill_mode = os.getenv('BACKFILL_FROM_DATE')
-    
-    if backfill_mode:
-        print("🔄 BACKFILL MODE ENABLED")
-        updated = backfill_historical_data(start_date=backfill_mode)
-        if updated > 0:
-            verify_latest_data()
-        sys.exit(0)
-    
-    # Normal daily update
-    # Fetch last 10 days to catch up on any missed days
-    records = fetch_latest_stock_price(days_back=10)
+    # Fetch from NSE India
+    records = fetch_nse_stock_data(symbol='TIPSMUSIC', days_back=10)
     
     if records:
         # Update Supabase
@@ -309,26 +252,22 @@ def main():
             print(f"Latest price: ₹{records[-1]['close']:.2f}")
             print()
             
-            # Verify the update
+            # Verify
             verify_latest_data()
             
-            print("\n📌 Next steps:")
+            print("📌 Next steps:")
             print("   1. Verify data in Supabase → stock_prices table")
             print("   2. Dashboard will auto-refresh with new data")
         else:
             print("\n❌ Update failed - no records were updated")
             sys.exit(1)
     else:
-        print("\n⚠️  No stock data fetched - possible market holiday or API issue")
-        # Check if today is a weekend
+        print("\n⚠️  No stock data fetched - possible market holiday or NSE issue")
         today = datetime.now().weekday()
-        if today >= 5:  # Saturday=5, Sunday=6
+        if today >= 5:
             print("   (This is expected on weekends)")
         else:
-            print("   (Check if BSE/NSE is open today)")
-        
-        # Don't fail on weekends/holidays
-        print("\n   Skipping update - no error")
+            print("   (Check if NSE is open today)")
     
     print(f"\nEnd time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
