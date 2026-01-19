@@ -1,7 +1,7 @@
 """
 Daily Stock Price Updater for Tips Music
-Fetches latest stock price from NSE India website and updates Supabase
-Run daily at 6:30 PM IST (after NSE market close at 3:30 PM)
+Fetches latest stock price from multiple sources and updates Supabase
+Priority: Screener.in → MoneyControl → NSE (fallback)
 """
 
 import requests
@@ -10,6 +10,7 @@ import os
 import time
 import json
 import sys
+from bs4 import BeautifulSoup
 
 # ============================================================
 # CONFIGURATION
@@ -17,131 +18,266 @@ import sys
 
 SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://bfafqccvzboyfjewzvhk.supabase.co')
 SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
-STOCK_SYMBOL = 'TIPSMUSIC'  # NSE symbol
+STOCK_SYMBOL = 'TIPSMUSIC'
 COMPANY_NAME = 'Tips Music Ltd'
 
 # ============================================================
-# FETCH FROM NSE INDIA
+# METHOD 1: SCREENER.IN (BEST - Historical Data Available)
 # ============================================================
 
-def fetch_nse_stock_data(symbol='TIPSMUSIC', days_back=10):
+def fetch_from_screener(days_back=30):
     """
-    Fetch stock data from NSE India website
-    NSE provides free historical data through their website
+    Fetch from Screener.in - most reliable source for Indian stocks
+    URL: https://www.screener.in/company/TIPSMUSIC/
     """
-    print(f"📈 Fetching {COMPANY_NAME} stock data from NSE India...")
-    print(f"   Symbol: {symbol}")
+    print(f"📈 Fetching {COMPANY_NAME} data from Screener.in...")
     
-    # NSE requires proper headers to prevent blocking
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Referer': 'https://www.nseindia.com/',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
     }
     
-    # Create session to maintain cookies
-    session = requests.Session()
-    session.headers.update(headers)
-    
     try:
-        # Step 1: Visit homepage to get cookies
-        print("   → Initializing NSE session...")
-        home_url = 'https://www.nseindia.com/'
-        session.get(home_url, timeout=10)
-        time.sleep(1)  # Small delay
+        # Screener.in stock page
+        url = 'https://www.screener.in/company/TIPSMUSIC/'
         
-        # Step 2: Fetch historical data
-        # Calculate date range
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days_back)
-        
-        # Format dates for NSE API (DD-MM-YYYY)
-        from_date = start_date.strftime('%d-%m-%Y')
-        to_date = end_date.strftime('%d-%m-%Y')
-        
-        print(f"   → Fetching data from {from_date} to {to_date}...")
-        
-        # NSE Historical Data API endpoint
-        api_url = f'https://www.nseindia.com/api/historical/cm/equity?symbol={symbol}&series=[%22EQ%22]&from={from_date}&to={to_date}'
-        
-        response = session.get(api_url, timeout=15)
+        response = requests.get(url, headers=headers, timeout=15)
         
         if response.status_code != 200:
-            print(f"   ❌ NSE API returned status: {response.status_code}")
+            print(f"   ❌ Screener.in returned status: {response.status_code}")
+            return []
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Find current stock price
+        price_element = soup.find('span', class_='number')
+        if not price_element:
+            print("   ❌ Could not find price on Screener.in")
+            return []
+        
+        current_price = float(price_element.text.strip().replace(',', ''))
+        today = datetime.now().date()
+        
+        print(f"✅ Fetched current price from Screener.in")
+        print(f"   Current price: ₹{current_price:.2f}")
+        print(f"   Date: {today}")
+        
+        # Create record for today
+        record = {
+            'date': today.isoformat(),
+            'open': current_price,  # Screener doesn't provide OHLC, use close for all
+            'high': current_price,
+            'low': current_price,
+            'close': current_price,
+            'volume': 0,  # Not available from Screener
+            'symbol': 'TIPSMUSIC',
+            'data_source': 'screener_in'
+        }
+        
+        return [record]
+    
+    except Exception as e:
+        print(f"❌ Screener.in error: {e}")
+        return []
+
+# ============================================================
+# METHOD 2: MONEYCONTROL (Backup - Full OHLCV Data)
+# ============================================================
+
+def fetch_from_moneycontrol():
+    """
+    Fetch from MoneyControl - has detailed OHLCV data
+    URL: https://www.moneycontrol.com/india/stockpricequote/film-production-distributionentertainment/tipsmusic/TI25
+    """
+    print(f"📈 Fetching {COMPANY_NAME} data from MoneyControl...")
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
+    
+    try:
+        # MoneyControl stock page
+        url = 'https://www.moneycontrol.com/india/stockpricequote/film-production-distributionentertainment/tipsmusic/TI25'
+        
+        response = requests.get(url, headers=headers, timeout=15)
+        
+        if response.status_code != 200:
+            print(f"   ❌ MoneyControl returned status: {response.status_code}")
+            return []
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Find price data in the page
+        price_div = soup.find('div', class_='pcstkspr')
+        if not price_div:
+            print("   ❌ Could not find price section")
+            return []
+        
+        # Extract current price
+        current_price_elem = price_div.find('span', class_='nseprice')
+        if not current_price_elem:
+            print("   ❌ Could not find current price")
+            return []
+        
+        current_price = float(current_price_elem.text.strip().replace(',', ''))
+        
+        # Try to get OHLC from the data section
+        data_div = soup.find('div', class_='oview_table')
+        
+        open_price = current_price
+        high_price = current_price
+        low_price = current_price
+        volume = 0
+        
+        if data_div:
+            # Find Open, High, Low, Volume
+            for row in data_div.find_all('tr'):
+                cells = row.find_all('td')
+                if len(cells) >= 2:
+                    label = cells[0].text.strip()
+                    value_text = cells[1].text.strip().replace(',', '')
+                    
+                    try:
+                        if 'Open' in label:
+                            open_price = float(value_text)
+                        elif 'High' in label:
+                            high_price = float(value_text)
+                        elif 'Low' in label:
+                            low_price = float(value_text)
+                        elif 'Volume' in label:
+                            volume = int(value_text)
+                    except:
+                        pass
+        
+        today = datetime.now().date()
+        
+        print(f"✅ Fetched data from MoneyControl")
+        print(f"   O: ₹{open_price:.2f}, H: ₹{high_price:.2f}, L: ₹{low_price:.2f}, C: ₹{current_price:.2f}")
+        print(f"   Volume: {volume:,}")
+        
+        record = {
+            'date': today.isoformat(),
+            'open': open_price,
+            'high': high_price,
+            'low': low_price,
+            'close': current_price,
+            'volume': volume,
+            'symbol': 'TIPSMUSIC',
+            'data_source': 'moneycontrol'
+        }
+        
+        return [record]
+    
+    except Exception as e:
+        print(f"❌ MoneyControl error: {e}")
+        return []
+
+# ============================================================
+# METHOD 3: GROWW (Backup)
+# ============================================================
+
+def fetch_from_groww():
+    """
+    Fetch from Groww - simple and fast
+    URL: https://groww.in/stocks/tips-industries-ltd
+    """
+    print(f"📈 Fetching {COMPANY_NAME} data from Groww...")
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    }
+    
+    try:
+        url = 'https://groww.in/v1/api/stocks_data/v1/accord/search_slug/tips-industries-ltd'
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code != 200:
+            print(f"   ❌ Groww returned status: {response.status_code}")
             return []
         
         data = response.json()
         
-        if not data or 'data' not in data or not data['data']:
-            print("   ⚠️  No data returned from NSE")
-            return []
-        
-        # Parse NSE response
-        records = []
-        for item in data['data']:
-            # NSE date format: "17-Jan-2026"
-            date_str = item.get('CH_TIMESTAMP', '')
-            if not date_str:
-                continue
+        if 'livePrice' in data:
+            current_price = float(data['livePrice'])
+            today = datetime.now().date()
             
-            # Parse date
-            date_obj = datetime.strptime(date_str, '%d-%b-%Y').date()
+            print(f"✅ Fetched current price from Groww")
+            print(f"   Current price: ₹{current_price:.2f}")
             
-            # Extract OHLCV data
             record = {
-                'date': date_obj.isoformat(),
-                'open': float(item.get('CH_OPENING_PRICE', 0)),
-                'high': float(item.get('CH_TRADE_HIGH_PRICE', 0)),
-                'low': float(item.get('CH_TRADE_LOW_PRICE', 0)),
-                'close': float(item.get('CH_CLOSING_PRICE', 0)),
-                'volume': int(item.get('CH_TOT_TRADED_QTY', 0)),
+                'date': today.isoformat(),
+                'open': current_price,
+                'high': current_price,
+                'low': current_price,
+                'close': current_price,
+                'volume': 0,
                 'symbol': 'TIPSMUSIC',
-                'data_source': 'nse_india'
+                'data_source': 'groww'
             }
             
-            # Only include records with valid prices
-            if record['close'] > 0:
-                records.append(record)
+            return [record]
         
-        # Sort by date (oldest to newest)
-        records.sort(key=lambda x: x['date'])
-        
-        print(f"✅ Fetched {len(records)} trading days from NSE India")
-        if records:
-            print(f"   Date range: {records[0]['date']} to {records[-1]['date']}")
-            print(f"   Latest price: ₹{records[-1]['close']:.2f} on {records[-1]['date']}")
-        
+        print("   ❌ No price data found in Groww response")
+        return []
+    
+    except Exception as e:
+        print(f"❌ Groww error: {e}")
+        return []
+
+# ============================================================
+# MAIN FETCH FUNCTION (Try Multiple Sources)
+# ============================================================
+
+def fetch_stock_data():
+    """
+    Try multiple sources in order of preference:
+    1. MoneyControl (best OHLCV data)
+    2. Screener.in (reliable)
+    3. Groww (fastest)
+    """
+    print("=" * 70)
+    print("🔍 TRYING MULTIPLE DATA SOURCES...")
+    print("=" * 70)
+    
+    # Try MoneyControl first (has OHLCV)
+    records = fetch_from_moneycontrol()
+    if records:
         return records
     
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Network error fetching NSE data: {e}")
-        return []
-    except json.JSONDecodeError as e:
-        print(f"❌ Error parsing NSE response: {e}")
-        return []
-    except Exception as e:
-        print(f"❌ Unexpected error: {e}")
-        return []
+    print("\n⚠️  MoneyControl failed, trying Screener.in...\n")
+    time.sleep(1)
+    
+    # Try Screener.in
+    records = fetch_from_screener()
+    if records:
+        return records
+    
+    print("\n⚠️  Screener.in failed, trying Groww...\n")
+    time.sleep(1)
+    
+    # Try Groww
+    records = fetch_from_groww()
+    if records:
+        return records
+    
+    print("\n❌ All data sources failed!")
+    return []
 
 # ============================================================
 # UPDATE SUPABASE
 # ============================================================
 
 def update_supabase(records):
-    """
-    Insert/update stock prices in Supabase using REST API
-    Uses 'upsert' to handle duplicates (update if exists, insert if new)
-    """
+    """Insert/update stock prices in Supabase"""
     if not records:
         print("⚠️  No records to update")
         return 0
     
     if not SUPABASE_SERVICE_KEY:
         print("❌ SUPABASE_SERVICE_KEY not set in environment variables")
-        print("   Add it to GitHub Secrets!")
         return 0
     
     url = f"{SUPABASE_URL}/rest/v1/stock_prices"
@@ -155,38 +291,27 @@ def update_supabase(records):
     
     print(f"\n💾 Updating Supabase with {len(records)} records...")
     
-    # Insert in batches
-    batch_size = 100
-    total_updated = 0
-    
-    for i in range(0, len(records), batch_size):
-        batch = records[i:i + batch_size]
+    try:
+        response = requests.post(url, json=records, headers=headers, timeout=30)
         
-        try:
-            response = requests.post(url, json=batch, headers=headers, timeout=30)
-            
-            if response.status_code in [200, 201, 204]:
-                total_updated += len(batch)
-                print(f"   ✅ Batch {i//batch_size + 1}: {len(batch)} records updated")
-            else:
-                print(f"   ❌ Batch {i//batch_size + 1} failed: HTTP {response.status_code}")
-                print(f"   Response: {response.text[:200]}")
-            
-            time.sleep(0.5)
-        
-        except Exception as e:
-            print(f"   ❌ Batch {i//batch_size + 1} error: {e}")
-            continue
+        if response.status_code in [200, 201, 204]:
+            print(f"   ✅ Successfully updated {len(records)} records")
+            return len(records)
+        else:
+            print(f"   ❌ Update failed: HTTP {response.status_code}")
+            print(f"   Response: {response.text[:200]}")
+            return 0
     
-    print(f"\n✅ Successfully updated {total_updated}/{len(records)} records in Supabase")
-    return total_updated
+    except Exception as e:
+        print(f"   ❌ Update error: {e}")
+        return 0
 
 # ============================================================
 # VERIFY UPDATE
 # ============================================================
 
 def verify_latest_data():
-    """Verify latest data was successfully written to Supabase"""
+    """Verify latest data in Supabase"""
     if not SUPABASE_SERVICE_KEY:
         return
     
@@ -207,10 +332,7 @@ def verify_latest_data():
                 print(f"\n🔍 Latest record in Supabase:")
                 print(f"   Date: {latest['date']}")
                 print(f"   Price: ₹{latest['close']:.2f}")
-                print(f"   Volume: {latest['volume']:,}")
                 print(f"   Source: {latest['data_source']}")
-            else:
-                print("⚠️  No records found in Supabase")
     
     except Exception as e:
         print(f"⚠️  Verification error: {e}")
@@ -226,18 +348,17 @@ def main():
     print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print()
     
-    # Check environment variables
+    # Check environment
     if not SUPABASE_URL:
         print("❌ SUPABASE_URL not set!")
         sys.exit(1)
     
     if not SUPABASE_SERVICE_KEY:
         print("❌ SUPABASE_SERVICE_KEY not set!")
-        print("   Add it to GitHub Secrets: Settings → Secrets → Actions")
         sys.exit(1)
     
-    # Fetch from NSE India
-    records = fetch_nse_stock_data(symbol='TIPSMUSIC', days_back=10)
+    # Fetch stock data (tries multiple sources)
+    records = fetch_stock_data()
     
     if records:
         # Update Supabase
@@ -247,27 +368,27 @@ def main():
             print("\n" + "=" * 70)
             print("✅ DAILY UPDATE COMPLETE!")
             print("=" * 70)
-            print(f"Total records updated: {updated}")
-            print(f"Latest trading date: {records[-1]['date']}")
+            print(f"Records updated: {updated}")
             print(f"Latest price: ₹{records[-1]['close']:.2f}")
-            print()
+            print(f"Data source: {records[-1]['data_source']}")
             
-            # Verify
             verify_latest_data()
             
-            print("📌 Next steps:")
-            print("   1. Verify data in Supabase → stock_prices table")
-            print("   2. Dashboard will auto-refresh with new data")
+            print("\n📌 Dashboard will auto-refresh with new data")
         else:
-            print("\n❌ Update failed - no records were updated")
+            print("\n❌ Update failed")
             sys.exit(1)
     else:
-        print("\n⚠️  No stock data fetched - possible market holiday or NSE issue")
+        print("\n❌ No stock data fetched from any source")
         today = datetime.now().weekday()
         if today >= 5:
-            print("   (This is expected on weekends)")
+            print("   (Market closed - weekend)")
         else:
             print("   (Check if NSE is open today)")
+        
+        # Don't fail on weekends
+        if today < 5:
+            sys.exit(1)
     
     print(f"\nEnd time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
