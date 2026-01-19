@@ -1,11 +1,12 @@
-name: Daily Stock Price Update
+name: 📊 Daily Stock Price Update
 
 on:
+  # Run daily at 6:30 PM IST (1:00 PM UTC)
   schedule:
-    # Run daily at 1:00 PM UTC = 6:30 PM IST (after NSE market close at 3:30 PM IST)
-    - cron: '0 13 * * 1-5'  # Monday to Friday only (trading days)
+    - cron: '0 13 * * 1-5'  # Monday-Friday at 1:00 PM UTC (6:30 PM IST)
   
-  workflow_dispatch:  # Allow manual trigger for testing
+  # Allow manual trigger
+  workflow_dispatch:
 
 jobs:
   update-stock-prices:
@@ -15,7 +16,7 @@ jobs:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
       
-      - name: 🐍 Set up Python 3.11
+      - name: 🐍 Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -23,16 +24,23 @@ jobs:
       - name: 📦 Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements_update.txt
+          pip install yfinance==0.2.40 requests==2.31.0 pandas==2.2.0
       
-      - name: 📊 Fetch & Update Stock Prices
+      - name: 📈 Fetch and Update Stock Prices
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
-          python update_stock_prices.py
+          python scripts/update_stock_prices.py
       
-      - name: ✅ Update Complete
+      - name: ✅ Update Status
+        if: success()
         run: |
-          echo "Stock price update completed successfully"
-          date
+          echo "✅ Stock prices updated successfully!"
+          echo "Time: $(date +'%Y-%m-%d %H:%M:%S UTC')"
+      
+      - name: ❌ Failure Notification
+        if: failure()
+        run: |
+          echo "❌ Stock price update failed!"
+          echo "Check logs for details"
