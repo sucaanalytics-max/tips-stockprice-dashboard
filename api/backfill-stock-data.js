@@ -1,137 +1,49 @@
-import { createClient } from '@supabase/supabase-js';
-
-const SUPABASE_URL = 'https://bfafqccvzboyfjewzvhk.supabase.co';
-const SUPABASE_KEY = process.env.SUPABASE_KEY || 'YOUR_SUPABASE_ANON_KEY'; // Replace if needed
-
-const SYMBOL = 'TIPSMUSIC';
-
 export default async function handler(req, res) {
-    // Only allow GET requests for security
-    if (req.method !== 'GET') {
-        return res.status(405).json({ error: 'Method not allowed' });
-    }
-
+    // Set CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET');
+    
     try {
-        console.log('Starting backfill process...');
+        const SUPABASE_URL = 'https://bfafqccvzboyfjewzvhk.supabase.co';
+        const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJmYWZxY2N2emJveWZqZXd6dmhrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzU5ODE1MjIsImV4cCI6MjA1MTU1NzUyMn0.5vIXqHjZj_2rZBHx0xWKEZm9TaV5k7PL8HH9fqMqgG8';
         
-        const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-        
-        // Get date range from query params or use defaults
         const startDate = req.query.start || '2026-01-09';
         const endDate = req.query.end || new Date().toISOString().split('T')[0];
         
-        console.log(`Fetching data from ${startDate} to ${endDate}...`);
+        // Fetch from Yahoo Finance
+        const symbol = 'TIPSMUSIC.NS';
+        const start = Math.floor(new Date(startDate).getTime() / 1000);
+        const end = Math.floor(new Date(endDate).getTime() / 1000);
         
-        // Fetch historical data from Yahoo Finance
-        const historicalData = await fetchHistoricalData(startDate, endDate);
+        const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?period1=${start}&period2=${end}&interval=1d`;
         
-        if (historicalData.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'No historical data found',
-                startDate,
-                endDate
-            });
-        }
-        
-        console.log(`Fetched ${historicalData.length} records`);
-        
-        // Insert/update records
-        const results = {
-            success: 0,
-            failed: 0,
-            records: []
-        };
-        
-        for (const record of historicalData) {
-            try {
-                const { error } = await supabase
-                    .from('stock_prices')
-                    .upsert(record, { 
-                        onConflict: 'symbol,date',
-                        ignoreDuplicates: false 
-                    });
-                
-                if (error) throw error;
-                
-                results.success++;
-                results.records.push({
-                    date: record.date,
-                    close: record.close,
-                    status: 'inserted/updated'
-                });
-                
-                console.log(`✅ ${record.date}: ₹${record.close}`);
-            } catch (error) {
-                results.failed++;
-                results.records.push({
-                    date: record.date,
-                    status: 'failed',
-                    error: error.message
-                });
-                console.error(`❌ ${record.date}:`, error);
-            }
-        }
-        
-        return res.status(200).json({
-            success: true,
-            message: 'Backfill completed',
-            symbol: SYMBOL,
-            dateRange: { start: startDate, end: endDate },
-            summary: {
-                total: historicalData.length,
-                successful: results.success,
-                failed: results.failed
-            },
-            records: results.records
-        });
-        
-    } catch (error) {
-        console.error('Backfill error:', error);
-        return res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-}
-
-async function fetchHistoricalData(startDate, endDate) {
-    const symbol = `${SYMBOL}.NS`; // NSE suffix for Yahoo Finance
-    const start = Math.floor(new Date(startDate).getTime() / 1000);
-    const end = Math.floor(new Date(endDate).getTime() / 1000);
-    
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?period1=${start}&period2=${end}&interval=1d`;
-    
-    try {
-        const response = await fetch(url, {
+        const yahooResponse = await fetch(yahooUrl, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
         });
         
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
+        const yahooData = await yahooResponse.json();
+        const result = yahooData.chart?.result?.[0];
         
-        const data = await response.json();
-        
-        const result = data.chart?.result?.[0];
         if (!result) {
-            throw new Error('No data in response');
+            return res.status(404).json({
+                success: false,
+                message: 'No data from Yahoo Finance',
+                yahooUrl
+            });
         }
         
         const timestamps = result.timestamp || [];
         const quotes = result.indicators?.quote?.[0] || {};
         
-        const historicalData = [];
-        
+        // Build records array
+        const records = [];
         for (let i = 0; i < timestamps.length; i++) {
             const date = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
-            
-            // Only add if we have valid price data
-            if (quotes.close && quotes.close[i]) {
-                historicalData.push({
-                    symbol: SYMBOL,
+            if (quotes.close?.[i]) {
+                records.push({
+                    symbol: 'TIPSMUSIC',
                     date: date,
                     open: quotes.open?.[i] || 0,
                     high: quotes.high?.[i] || 0,
@@ -142,10 +54,55 @@ async function fetchHistoricalData(startDate, endDate) {
             }
         }
         
-        return historicalData;
+        // Insert into Supabase
+        let successCount = 0;
+        let failCount = 0;
+        const details = [];
+        
+        for (const record of records) {
+            try {
+                const response = await fetch(`${SUPABASE_URL}/rest/v1/stock_prices`, {
+                    method: 'POST',
+                    headers: {
+                        'apikey': SUPABASE_KEY,
+                        'Authorization': `Bearer ${SUPABASE_KEY}`,
+                        'Content-Type': 'application/json',
+                        'Prefer': 'resolution=merge-duplicates'
+                    },
+                    body: JSON.stringify(record)
+                });
+                
+                if (response.ok) {
+                    successCount++;
+                    details.push({ date: record.date, close: record.close, status: '✅' });
+                } else {
+                    failCount++;
+                    details.push({ date: record.date, status: '❌', error: await response.text() });
+                }
+            } catch (error) {
+                failCount++;
+                details.push({ date: record.date, status: '❌', error: error.message });
+            }
+        }
+        
+        return res.status(200).json({
+            success: true,
+            message: 'Backfill completed',
+            symbol: 'TIPSMUSIC',
+            dateRange: { start: startDate, end: endDate },
+            summary: {
+                total: records.length,
+                successful: successCount,
+                failed: failCount
+            },
+            records: details
+        });
         
     } catch (error) {
-        console.error('Error fetching from Yahoo Finance:', error);
-        throw error;
+        return res.status(500).json({
+            success: false,
+            error: error.message,
+            stack: error.stack
+        });
     }
 }
