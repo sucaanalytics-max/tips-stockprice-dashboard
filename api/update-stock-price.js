@@ -1,207 +1,145 @@
-// api/update-stock-price.js
-// Vercel Serverless Function to update TIPS stock price daily
-
 import { createClient } from '@supabase/supabase-js';
 
-// Initialize Supabase client
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://bfafqccvzboyfjewzvhk.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
-// Multiple stock price data sources
-async function fetchStockPrice() {
-  const symbol = 'TIPSMUSIC';
-  
-  // Option 1: Yahoo Finance (Most reliable for NSE stocks)
-  try {
-    const response = await fetch(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?interval=1d&range=1d`,
-      {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-      }
-    );
-    
-    if (response.ok) {
-      const data = await response.json();
-      const quote = data.chart.result[0];
-      const meta = quote.meta;
-      
-      return {
-        date: new Date().toISOString().split('T')[0],
-        open: meta.regularMarketPrice || meta.previousClose,
-        high: meta.regularMarketDayHigh || meta.regularMarketPrice,
-        low: meta.regularMarketDayLow || meta.regularMarketPrice,
-        close: meta.regularMarketPrice,
-        volume: meta.regularMarketVolume || 0,
-        source: 'yahoo_finance'
-      };
-    }
-  } catch (error) {
-    console.error('Yahoo Finance failed:', error);
-  }
-  
-  // Option 2: Alpha Vantage (Fallback)
-  if (process.env.ALPHA_VANTAGE_API_KEY) {
+// CORRECT NSE SYMBOL (as of Sep 30, 2024)
+const CORRECT_SYMBOL = 'TIPSMUSIC';
+
+export default async function handler(req, res) {
     try {
-      const response = await fetch(
-        `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}.BSE&apikey=${process.env.ALPHA_VANTAGE_API_KEY}`
-      );
-      
-      if (response.ok) {
-        const data = await response.json();
-        const quote = data['Global Quote'];
+        console.log('Starting stock price update...');
         
-        if (quote && quote['05. price']) {
-          return {
-            date: new Date().toISOString().split('T')[0],
-            open: parseFloat(quote['02. open']),
-            high: parseFloat(quote['03. high']),
-            low: parseFloat(quote['04. low']),
-            close: parseFloat(quote['05. price']),
-            volume: parseInt(quote['06. volume']),
-            source: 'alpha_vantage'
-          };
-        }
-      }
-    } catch (error) {
-      console.error('Alpha Vantage failed:', error);
-    }
-  }
-  
-  // Option 3: Twelve Data (Another fallback)
-  if (process.env.TWELVE_DATA_API_KEY) {
-    try {
-      const response = await fetch(
-        `https://api.twelvedata.com/quote?symbol=${symbol}&exchange=NSE&apikey=${process.env.TWELVE_DATA_API_KEY}`
-      );
-      
-      if (response.ok) {
-        const data = await response.json();
+        // Fetch stock price from NSE
+        const stockPrice = await fetchNSEPrice(CORRECT_SYMBOL);
         
-        if (data.close) {
-          return {
-            date: new Date().toISOString().split('T')[0],
-            open: parseFloat(data.open),
-            high: parseFloat(data.high),
-            low: parseFloat(data.low),
-            close: parseFloat(data.close),
-            volume: parseInt(data.volume),
-            source: 'twelve_data'
-          };
+        if (!stockPrice) {
+            throw new Error('Failed to fetch stock price');
         }
-      }
+        
+        // Initialize Supabase
+        const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+        
+        const today = new Date().toISOString().split('T')[0];
+        
+        // Check if today's price already exists
+        const { data: existing } = await supabase
+            .from('stock_prices')
+            .select('*')
+            .eq('symbol', CORRECT_SYMBOL)
+            .eq('date', today)
+            .single();
+        
+        if (existing) {
+            // Update existing record
+            const { error } = await supabase
+                .from('stock_prices')
+                .update({
+                    open: stockPrice.open,
+                    high: stockPrice.high,
+                    low: stockPrice.low,
+                    close: stockPrice.close,
+                    volume: stockPrice.volume,
+                    updated_at: new Date().toISOString()
+                })
+                .eq('symbol', CORRECT_SYMBOL)
+                .eq('date', today);
+            
+            if (error) throw error;
+            console.log(`✅ Updated stock price for ${today}`);
+        } else {
+            // Insert new record
+            const { error } = await supabase
+                .from('stock_prices')
+                .insert([{
+                    symbol: CORRECT_SYMBOL,
+                    date: today,
+                    open: stockPrice.open,
+                    high: stockPrice.high,
+                    low: stockPrice.low,
+                    close: stockPrice.close,
+                    volume: stockPrice.volume
+                }]);
+            
+            if (error) throw error;
+            console.log(`✅ Inserted stock price for ${today}`);
+        }
+        
+        return res.status(200).json({
+            success: true,
+            message: 'Stock price updated successfully',
+            symbol: CORRECT_SYMBOL,
+            date: today,
+            price: stockPrice.close
+        });
+        
     } catch (error) {
-      console.error('Twelve Data failed:', error);
+        console.error('Error updating stock price:', error);
+        return res.status(500).json({
+            success: false,
+            error: error.message
+        });
     }
-  }
-  
-  throw new Error('All stock price sources failed');
 }
 
-// Main handler
-export default async function handler(req, res) {
-  // Verify cron secret for security
-  if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  
-  try {
-    // Check if it's a trading day (Monday-Friday)
-    const today = new Date();
-    const dayOfWeek = today.getDay();
-    if (dayOfWeek === 0 || dayOfWeek === 6) {
-      return res.status(200).json({ 
-        message: 'Weekend - no trading', 
-        skipped: true 
-      });
-    }
-    
-    // Fetch current stock price
-    const stockData = await fetchStockPrice();
-    
-    // Check if today's data already exists
-    const { data: existing, error: checkError } = await supabase
-      .from('stock_prices')
-      .select('*')
-      .eq('date', stockData.date)
-      .single();
-    
-    if (checkError && checkError.code !== 'PGRST116') {
-      throw checkError;
-    }
-    
-    let result;
-    
-    if (existing) {
-      // Update existing record
-      const { data, error } = await supabase
-        .from('stock_prices')
-        .update({
-          open: stockData.open,
-          high: stockData.high,
-          low: stockData.low,
-          close: stockData.close,
-          volume: stockData.volume,
-          source: stockData.source,
-          updated_at: new Date().toISOString()
-        })
-        .eq('date', stockData.date)
-        .select();
-      
-      if (error) throw error;
-      result = { updated: data, action: 'updated' };
-    } else {
-      // Insert new record
-      const { data, error } = await supabase
-        .from('stock_prices')
-        .insert([{
-          date: stockData.date,
-          open: stockData.open,
-          high: stockData.high,
-          low: stockData.low,
-          close: stockData.close,
-          volume: stockData.volume,
-          source: stockData.source,
-          created_at: new Date().toISOString()
-        }])
-        .select();
-      
-      if (error) throw error;
-      result = { inserted: data, action: 'inserted' };
-    }
-    
-    // Log success
-    console.log('Stock price updated successfully:', result);
-    
-    return res.status(200).json({
-      success: true,
-      ...result,
-      stockData
-    });
-    
-  } catch (error) {
-    console.error('Error updating stock price:', error);
-    
-    // Log to Supabase for monitoring
+async function fetchNSEPrice(symbol) {
     try {
-      await supabase
-        .from('error_logs')
-        .insert([{
-          error_type: 'stock_price_update',
-          error_message: error.message,
-          error_details: JSON.stringify(error),
-          created_at: new Date().toISOString()
-        }]);
-    } catch (logError) {
-      console.error('Failed to log error:', logError);
+        // Option 1: NSE API (may require headers)
+        const url = `https://www.nseindia.com/api/quote-equity?symbol=${symbol}`;
+        
+        const response = await fetch(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0',
+                'Accept': 'application/json'
+            }
+        });
+        
+        if (!response.ok) {
+            console.log('NSE API failed, using fallback...');
+            return await fetchFallbackPrice(symbol);
+        }
+        
+        const data = await response.json();
+        
+        return {
+            open: data.priceInfo?.open || 0,
+            high: data.priceInfo?.intraDayHighLow?.max || 0,
+            low: data.priceInfo?.intraDayHighLow?.min || 0,
+            close: data.priceInfo?.lastPrice || 0,
+            volume: data.priceInfo?.totalTradedVolume || 0
+        };
+        
+    } catch (error) {
+        console.error('Error fetching NSE price:', error);
+        return await fetchFallbackPrice(symbol);
     }
-    
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
+}
+
+async function fetchFallbackPrice(symbol) {
+    // Fallback: Use Yahoo Finance or other provider
+    try {
+        const yahooSymbol = `${symbol}.NS`; // NSE suffix for Yahoo
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?interval=1d&range=1d`;
+        
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        const quote = data.chart?.result?.[0];
+        if (!quote) throw new Error('No data from fallback');
+        
+        const meta = quote.meta;
+        const indicators = quote.indicators?.quote?.[0];
+        
+        return {
+            open: indicators?.open?.[0] || meta.previousClose,
+            high: indicators?.high?.[0] || meta.regularMarketPrice,
+            low: indicators?.low?.[0] || meta.regularMarketPrice,
+            close: meta.regularMarketPrice || 0,
+            volume: indicators?.volume?.[0] || 0
+        };
+        
+    } catch (error) {
+        console.error('Fallback also failed:', error);
+        return null;
+    }
 }
